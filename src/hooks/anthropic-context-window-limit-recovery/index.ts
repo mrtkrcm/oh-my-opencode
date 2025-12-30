@@ -1,5 +1,5 @@
 import type { PluginInput } from "@opencode-ai/plugin"
-import type { AutoCompactState, ParsedTokenLimitError } from "./types"
+import type { AutoCompactState, ParsedTokenLimitError, SessionRecoveryState } from "./types"
 import type { ExperimentalConfig } from "../../config"
 import { parseAnthropicTokenLimitError } from "./parser"
 import { executeCompact, getLastAssistant } from "./executor"
@@ -14,12 +14,14 @@ function createRecoveryState(): AutoCompactState {
   return {
     pendingCompact: new Set<string>(),
     errorDataBySession: new Map<string, ParsedTokenLimitError>(),
+    sessionStateBySession: new Map<string, SessionRecoveryState>(),
+    compactionInProgress: new Set<string>(),
+    // Legacy Maps (kept for backwards compatibility during migration)
     retryStateBySession: new Map(),
     fallbackStateBySession: new Map(),
     truncateStateBySession: new Map(),
     dcpStateBySession: new Map(),
     emptyContentAttemptBySession: new Map(),
-    compactionInProgress: new Set<string>(),
   }
 }
 
@@ -36,11 +38,7 @@ export function createAnthropicContextWindowLimitRecoveryHook(ctx: PluginInput, 
       if (sessionInfo?.id) {
         autoCompactState.pendingCompact.delete(sessionInfo.id)
         autoCompactState.errorDataBySession.delete(sessionInfo.id)
-        autoCompactState.retryStateBySession.delete(sessionInfo.id)
-        autoCompactState.fallbackStateBySession.delete(sessionInfo.id)
-        autoCompactState.truncateStateBySession.delete(sessionInfo.id)
-        autoCompactState.dcpStateBySession.delete(sessionInfo.id)
-        autoCompactState.emptyContentAttemptBySession.delete(sessionInfo.id)
+        autoCompactState.sessionStateBySession.delete(sessionInfo.id)
         autoCompactState.compactionInProgress.delete(sessionInfo.id)
       }
       return
@@ -154,6 +152,7 @@ export function createAnthropicContextWindowLimitRecoveryHook(ctx: PluginInput, 
   }
 }
 
-export type { AutoCompactState, DcpState, FallbackState, ParsedTokenLimitError, TruncateState } from "./types"
+export type { AutoCompactState, DcpState, FallbackState, ParsedTokenLimitError, SessionRecoveryState, TruncateState } from "./types"
+export { createDefaultSessionState } from "./types"
 export { parseAnthropicTokenLimitError } from "./parser"
 export { executeCompact, getLastAssistant } from "./executor"

@@ -72,6 +72,24 @@ function extractResumeConfig(userMessage: MessageData | undefined, sessionID: st
   }
 }
 
+/**
+ * Attempts auto-resume after successful recovery if enabled in config.
+ * Consolidates repetitive auto-resume logic across error handlers.
+ */
+async function tryAutoResume(
+  success: boolean,
+  experimental: ExperimentalConfig | undefined,
+  msgs: MessageData[] | null | undefined,
+  sessionID: string,
+  client: Client
+): Promise<void> {
+  if (success && experimental?.auto_resume) {
+    const lastUser = findLastUserMessage(msgs ?? [])
+    const resumeConfig = extractResumeConfig(lastUser, sessionID)
+    await resumeSession(client, resumeConfig)
+  }
+}
+
 async function resumeSession(client: Client, config: ResumeConfig): Promise<boolean> {
   try {
     await client.session.prompt({
@@ -391,32 +409,16 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
 
       if (errorType === "tool_result_missing") {
         success = await recoverToolResultMissing(ctx.client, sessionID, failedMsg)
-        if (success && experimental?.auto_resume) {
-          const lastUser = findLastUserMessage(msgs ?? [])
-          const resumeConfig = extractResumeConfig(lastUser, sessionID)
-          await resumeSession(ctx.client, resumeConfig)
-        }
+        await tryAutoResume(success, experimental, msgs, sessionID, ctx.client)
       } else if (errorType === "thinking_block_order") {
         success = await recoverThinkingBlockOrder(ctx.client, sessionID, failedMsg, ctx.directory, info.error)
-        if (success && experimental?.auto_resume) {
-          const lastUser = findLastUserMessage(msgs ?? [])
-          const resumeConfig = extractResumeConfig(lastUser, sessionID)
-          await resumeSession(ctx.client, resumeConfig)
-        }
+        await tryAutoResume(success, experimental, msgs, sessionID, ctx.client)
       } else if (errorType === "thinking_disabled_violation") {
         success = await recoverThinkingDisabledViolation(ctx.client, sessionID, failedMsg)
-        if (success && experimental?.auto_resume) {
-          const lastUser = findLastUserMessage(msgs ?? [])
-          const resumeConfig = extractResumeConfig(lastUser, sessionID)
-          await resumeSession(ctx.client, resumeConfig)
-        }
+        await tryAutoResume(success, experimental, msgs, sessionID, ctx.client)
       } else if (errorType === "empty_content_message") {
         success = await recoverEmptyContentMessage(ctx.client, sessionID, failedMsg, ctx.directory, info.error)
-        if (success && experimental?.auto_resume) {
-          const lastUser = findLastUserMessage(msgs ?? [])
-          const resumeConfig = extractResumeConfig(lastUser, sessionID)
-          await resumeSession(ctx.client, resumeConfig)
-        }
+        await tryAutoResume(success, experimental, msgs, sessionID, ctx.client)
       }
 
       return success

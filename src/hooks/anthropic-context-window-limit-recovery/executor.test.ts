@@ -14,12 +14,14 @@ describe("executeCompact lock management", () => {
     autoCompactState = {
       pendingCompact: new Set<string>(),
       errorDataBySession: new Map(),
+      sessionStateBySession: new Map(),
+      compactionInProgress: new Set<string>(),
+      // Legacy Maps (kept for backwards compatibility)
       retryStateBySession: new Map(),
       fallbackStateBySession: new Map(),
       truncateStateBySession: new Map(),
       dcpStateBySession: new Map(),
       emptyContentAttemptBySession: new Map(),
-      compactionInProgress: new Set<string>(),
     }
 
     mockClient = {
@@ -190,16 +192,13 @@ describe("executeCompact lock management", () => {
     // #given: All retry/revert attempts exhausted
     mockClient.session.messages = mock(() => Promise.resolve({ data: [] }))
 
-    // Max out all attempts
-    autoCompactState.retryStateBySession.set(sessionID, {
-      attempt: 5,
-      lastAttemptTime: Date.now(),
-    })
-    autoCompactState.fallbackStateBySession.set(sessionID, {
-      revertAttempt: 5,
-    })
-    autoCompactState.truncateStateBySession.set(sessionID, {
-      truncateAttempt: 5,
+    // Max out all attempts using unified state
+    autoCompactState.sessionStateBySession.set(sessionID, {
+      retry: { attempt: 5, lastAttemptTime: Date.now() },
+      fallback: { revertAttempt: 5 },
+      truncate: { truncateAttempt: 5 },
+      dcp: { attempted: true, itemsPruned: 0 },
+      emptyContentAttempt: 0,
     })
     autoCompactState.errorDataBySession.set(sessionID, {
       errorType: "token_limit",

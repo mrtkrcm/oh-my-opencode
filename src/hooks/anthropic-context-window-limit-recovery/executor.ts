@@ -1,12 +1,9 @@
 import type {
   AutoCompactState,
-  DcpState,
-  FallbackState,
-  RetryState,
-  TruncateState,
+  SessionRecoveryState,
 } from "./types";
 import type { ExperimentalConfig } from "../../config";
-import { FALLBACK_CONFIG, RETRY_CONFIG, TRUNCATE_CONFIG } from "./types";
+import { FALLBACK_CONFIG, RETRY_CONFIG, TRUNCATE_CONFIG, createDefaultSessionState } from "./types";
 import { executeDynamicContextPruning } from "./pruning-executor";
 import {
   findLargestToolResult,
@@ -57,50 +54,17 @@ type Client = {
   };
 };
 
-function getOrCreateRetryState(
+/**
+ * Get or create unified session state - consolidates 4 separate getOrCreate functions.
+ */
+function getOrCreateSessionState(
   autoCompactState: AutoCompactState,
   sessionID: string,
-): RetryState {
-  let state = autoCompactState.retryStateBySession.get(sessionID);
+): SessionRecoveryState {
+  let state = autoCompactState.sessionStateBySession.get(sessionID);
   if (!state) {
-    state = { attempt: 0, lastAttemptTime: 0 };
-    autoCompactState.retryStateBySession.set(sessionID, state);
-  }
-  return state;
-}
-
-function getOrCreateFallbackState(
-  autoCompactState: AutoCompactState,
-  sessionID: string,
-): FallbackState {
-  let state = autoCompactState.fallbackStateBySession.get(sessionID);
-  if (!state) {
-    state = { revertAttempt: 0 };
-    autoCompactState.fallbackStateBySession.set(sessionID, state);
-  }
-  return state;
-}
-
-function getOrCreateTruncateState(
-  autoCompactState: AutoCompactState,
-  sessionID: string,
-): TruncateState {
-  let state = autoCompactState.truncateStateBySession.get(sessionID);
-  if (!state) {
-    state = { truncateAttempt: 0 };
-    autoCompactState.truncateStateBySession.set(sessionID, state);
-  }
-  return state;
-}
-
-function getOrCreateDcpState(
-  autoCompactState: AutoCompactState,
-  sessionID: string,
-): DcpState {
-  let state = autoCompactState.dcpStateBySession.get(sessionID);
-  if (!state) {
-    state = { attempted: false, itemsPruned: 0 };
-    autoCompactState.dcpStateBySession.set(sessionID, state);
+    state = createDefaultSessionState();
+    autoCompactState.sessionStateBySession.set(sessionID, state);
   }
   return state;
 }
@@ -227,11 +191,7 @@ function clearSessionState(
 ): void {
   autoCompactState.pendingCompact.delete(sessionID);
   autoCompactState.errorDataBySession.delete(sessionID);
-  autoCompactState.retryStateBySession.delete(sessionID);
-  autoCompactState.fallbackStateBySession.delete(sessionID);
-  autoCompactState.truncateStateBySession.delete(sessionID);
-  autoCompactState.dcpStateBySession.delete(sessionID);
-  autoCompactState.emptyContentAttemptBySession.delete(sessionID);
+  autoCompactState.sessionStateBySession.delete(sessionID);
   autoCompactState.compactionInProgress.delete(sessionID);
 }
 
@@ -239,7 +199,8 @@ function getOrCreateEmptyContentAttempt(
   autoCompactState: AutoCompactState,
   sessionID: string,
 ): number {
-  return autoCompactState.emptyContentAttemptBySession.get(sessionID) ?? 0;
+  const state = getOrCreateSessionState(autoCompactState, sessionID);
+  return state.emptyContentAttempt;
 }
 
 async function fixEmptyMessages(
@@ -248,8 +209,8 @@ async function fixEmptyMessages(
   client: Client,
   messageIndex?: number,
 ): Promise<boolean> {
-  const attempt = getOrCreateEmptyContentAttempt(autoCompactState, sessionID);
-  autoCompactState.emptyContentAttemptBySession.set(sessionID, attempt + 1);
+  const state = getOrCreateSessionState(autoCompactState, sessionID);
+  state.emptyContentAttempt++;
 
   let fixed = false;
   const fixedMessageIds: string[] = [];
@@ -357,18 +318,17 @@ export async function executeCompact(
 
   try {
     const errorData = autoCompactState.errorDataBySession.get(sessionID);
-    const truncateState = getOrCreateTruncateState(autoCompactState, sessionID);
+    const sessionState = getOrCreateSessionState(autoCompactState, sessionID);
 
     // DCP FIRST - run before any other recovery attempts when token limit exceeded (controlled by dcp-for-compaction hook)
-    const dcpState = getOrCreateDcpState(autoCompactState, sessionID);
     if (
       dcpForCompaction !== false &&
-      !dcpState.attempted &&
+      !sessionState.dcp.attempted &&
       errorData?.currentTokens &&
       errorData?.maxTokens &&
       errorData.currentTokens > errorData.maxTokens
     ) {
-      dcpState.attempted = true;
+      sessionState.dcp.attempted = true;
       log("[auto-compact] DCP triggered FIRST on token limit error", {
         sessionID,
         currentTokens: errorData.currentTokens,
@@ -389,7 +349,7 @@ export async function executeCompact(
         );
 
         if (pruningResult.itemsPruned > 0) {
-          dcpState.itemsPruned = pruningResult.itemsPruned;
+          sessionState.dcp.itemsPruned = pruningResult.itemsPruned;
           log("[auto-compact] DCP successful, proceeding to compaction", {
             itemsPruned: pruningResult.itemsPruned,
             tokensSaved: pruningResult.totalTokensSaved,
@@ -462,7 +422,7 @@ export async function executeCompact(
       errorData?.currentTokens &&
       errorData?.maxTokens &&
       errorData.currentTokens > errorData.maxTokens &&
-      truncateState.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts
+      sessionState.truncate.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts
     ) {
       log("[auto-compact] aggressive truncation triggered (experimental)", {
         currentTokens: errorData.currentTokens,
@@ -479,7 +439,7 @@ export async function executeCompact(
       );
 
       if (aggressiveResult.truncatedCount > 0) {
-        truncateState.truncateAttempt += aggressiveResult.truncatedCount;
+        sessionState.truncate.truncateAttempt += aggressiveResult.truncatedCount;
 
         const toolNames = aggressiveResult.truncatedTools
           .map((t) => t.toolName)
@@ -531,7 +491,7 @@ export async function executeCompact(
 
     let skipSummarize = false;
 
-    if (truncateState.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts) {
+    if (sessionState.truncate.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts) {
       const largest = findLargestToolResult(sessionID);
 
       if (
@@ -541,8 +501,8 @@ export async function executeCompact(
         const result = truncateToolResult(largest.partPath);
 
         if (result.success) {
-          truncateState.truncateAttempt++;
-          truncateState.lastTruncatedPartId = largest.partId;
+          sessionState.truncate.truncateAttempt++;
+          sessionState.truncate.lastTruncatedPartId = largest.partId;
 
           await (client as Client).tui
             .showToast({
@@ -596,14 +556,8 @@ export async function executeCompact(
       }
     }
 
-    const retryState = getOrCreateRetryState(autoCompactState, sessionID);
-
     if (errorData?.errorType?.includes("non-empty content")) {
-      const attempt = getOrCreateEmptyContentAttempt(
-        autoCompactState,
-        sessionID,
-      );
-      if (attempt < 3) {
+      if (sessionState.emptyContentAttempt < 3) {
         const fixed = await fixEmptyMessages(
           sessionID,
           autoCompactState,
@@ -640,15 +594,16 @@ export async function executeCompact(
       }
     }
 
-    if (Date.now() - retryState.lastAttemptTime > 300000) {
-      retryState.attempt = 0;
-      autoCompactState.fallbackStateBySession.delete(sessionID);
-      autoCompactState.truncateStateBySession.delete(sessionID);
+    // Reset retry/fallback/truncate state after 5 minute timeout
+    if (Date.now() - sessionState.retry.lastAttemptTime > 300000) {
+      sessionState.retry.attempt = 0;
+      sessionState.fallback.revertAttempt = 0;
+      sessionState.truncate.truncateAttempt = 0;
     }
 
-    if (!skipSummarize && retryState.attempt < RETRY_CONFIG.maxAttempts) {
-      retryState.attempt++;
-      retryState.lastAttemptTime = Date.now();
+    if (!skipSummarize && sessionState.retry.attempt < RETRY_CONFIG.maxAttempts) {
+      sessionState.retry.attempt++;
+      sessionState.retry.lastAttemptTime = Date.now();
 
       const providerID = msg.providerID as string | undefined;
       const modelID = msg.modelID as string | undefined;
@@ -661,7 +616,7 @@ export async function executeCompact(
             .showToast({
               body: {
                 title: "Auto Compact",
-                message: `Summarizing session (attempt ${retryState.attempt}/${RETRY_CONFIG.maxAttempts})...`,
+                message: `Summarizing session (attempt ${sessionState.retry.attempt}/${RETRY_CONFIG.maxAttempts})...`,
                 variant: "warning",
                 duration: 3000,
               },
@@ -687,7 +642,7 @@ export async function executeCompact(
         } catch {
           const delay =
             RETRY_CONFIG.initialDelayMs *
-            Math.pow(RETRY_CONFIG.backoffFactor, retryState.attempt - 1);
+            Math.pow(RETRY_CONFIG.backoffFactor, sessionState.retry.attempt - 1);
           const cappedDelay = Math.min(delay, RETRY_CONFIG.maxDelayMs);
 
           setTimeout(() => {
@@ -717,9 +672,7 @@ export async function executeCompact(
       }
     }
 
-    const fallbackState = getOrCreateFallbackState(autoCompactState, sessionID);
-
-    if (fallbackState.revertAttempt < FALLBACK_CONFIG.maxRevertAttempts) {
+    if (sessionState.fallback.revertAttempt < FALLBACK_CONFIG.maxRevertAttempts) {
       const pair = await getLastMessagePair(
         sessionID,
         client as Client,
@@ -753,8 +706,8 @@ export async function executeCompact(
             query: { directory },
           });
 
-          fallbackState.revertAttempt++;
-          fallbackState.lastRevertedMessageID = pair.userMessageID;
+          sessionState.fallback.revertAttempt++;
+          sessionState.fallback.lastRevertedMessageID = pair.userMessageID;
 
           // Clear all state after successful revert - don't recurse
           clearSessionState(autoCompactState, sessionID);
