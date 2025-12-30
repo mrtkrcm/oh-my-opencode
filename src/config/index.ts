@@ -24,3 +24,12 @@ export type {
   DynamicContextPruningConfig,
   RalphLoopConfig,
 } from "./schema"
+
+export {
+  loadPluginConfigAsync,
+  clearConfigCache,
+  isConfigCached,
+  getConfigCacheStats,
+} from "./async-loader"
+
+export type { AsyncConfigLoaderOptions } from "./async-loader"

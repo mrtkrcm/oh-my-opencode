@@ -60,9 +60,9 @@ import {
 import { builtinTools, createCallOmoAgent, createBackgroundTools, createLookAt, createSkillTool, interactive_bash, getTmuxPath } from "./tools";
 import { BackgroundManager } from "./features/background-agent";
 import { createBuiltinMcps } from "./mcp";
-import { OhMyOpenCodeConfigSchema, type OhMyOpenCodeConfig, type HookName } from "./config";
-import { log, deepMerge, getUserConfigDir, addConfigLoadError, parseJsonc, detectConfigFile } from "./shared";
-import { PLAN_SYSTEM_PROMPT, PLAN_PERMISSION } from "./agents/plan-prompt";
+import { type OhMyOpenCodeConfig, type HookName, loadPluginConfigAsync } from "./config";
+import { log, deepMerge } from "./shared";
+import { createAgentConfigBuilder } from "./builders";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -129,102 +129,11 @@ function migrateConfigFile(configPath: string, rawConfig: Record<string, unknown
   return needsWrite;
 }
 
-function loadConfigFromPath(configPath: string, ctx: any): OhMyOpenCodeConfig | null {
-  try {
-    if (fs.existsSync(configPath)) {
-      const content = fs.readFileSync(configPath, "utf-8");
-      const rawConfig = parseJsonc<Record<string, unknown>>(content);
-
-      migrateConfigFile(configPath, rawConfig);
-
-      const result = OhMyOpenCodeConfigSchema.safeParse(rawConfig);
-
-      if (!result.success) {
-        const errorMsg = result.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join(", ");
-        log(`Config validation error in ${configPath}:`, result.error.issues);
-        addConfigLoadError({ path: configPath, error: `Validation error: ${errorMsg}` });
-        return null;
-      }
-
-      log(`Config loaded from ${configPath}`, { agents: result.data.agents });
-      return result.data;
-    }
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    log(`Error loading config from ${configPath}:`, err);
-    addConfigLoadError({ path: configPath, error: errorMsg });
-  }
-  return null;
-}
-
-function mergeConfigs(
-  base: OhMyOpenCodeConfig,
-  override: OhMyOpenCodeConfig
-): OhMyOpenCodeConfig {
-  return {
-    ...base,
-    ...override,
-    agents: deepMerge(base.agents, override.agents),
-    disabled_agents: [
-      ...new Set([
-        ...(base.disabled_agents ?? []),
-        ...(override.disabled_agents ?? []),
-      ]),
-    ],
-    disabled_mcps: [
-      ...new Set([
-        ...(base.disabled_mcps ?? []),
-        ...(override.disabled_mcps ?? []),
-      ]),
-    ],
-    disabled_hooks: [
-      ...new Set([
-        ...(base.disabled_hooks ?? []),
-        ...(override.disabled_hooks ?? []),
-      ]),
-    ],
-    disabled_commands: [
-      ...new Set([
-        ...(base.disabled_commands ?? []),
-        ...(override.disabled_commands ?? []),
-      ]),
-    ],
-    claude_code: deepMerge(base.claude_code, override.claude_code),
-  };
-}
-
-function loadPluginConfig(directory: string, ctx: any): OhMyOpenCodeConfig {
-  // User-level config path (OS-specific) - prefer .jsonc over .json
-  const userBasePath = path.join(getUserConfigDir(), "opencode", "oh-my-opencode");
-  const userDetected = detectConfigFile(userBasePath);
-  const userConfigPath = userDetected.format !== "none" ? userDetected.path : userBasePath + ".json";
-
-  // Project-level config path - prefer .jsonc over .json
-  const projectBasePath = path.join(directory, ".opencode", "oh-my-opencode");
-  const projectDetected = detectConfigFile(projectBasePath);
-  const projectConfigPath = projectDetected.format !== "none" ? projectDetected.path : projectBasePath + ".json";
-
-  // Load user config first (base)
-  let config: OhMyOpenCodeConfig = loadConfigFromPath(userConfigPath, ctx) ?? {};
-
-  // Override with project config
-  const projectConfig = loadConfigFromPath(projectConfigPath, ctx);
-  if (projectConfig) {
-    config = mergeConfigs(config, projectConfig);
-  }
-
-  log("Final merged config", {
-    agents: config.agents,
-    disabled_agents: config.disabled_agents,
-    disabled_mcps: config.disabled_mcps,
-    disabled_hooks: config.disabled_hooks,
-    claude_code: config.claude_code,
-  });
-  return config;
-}
-
 const OhMyOpenCodePlugin: Plugin = async (ctx) => {
-  const pluginConfig = loadPluginConfig(ctx.directory, ctx);
+  // Use async config loader with mtime-based caching and parallel loading
+  const pluginConfig = await loadPluginConfigAsync(ctx.directory, {
+    migrateConfigFile,
+  });
   const disabledHooks = new Set(pluginConfig.disabled_hooks ?? []);
   const isHookEnabled = (hookName: HookName) => !disabledHooks.has(hookName);
 
@@ -456,6 +365,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
         log(`Plugin load errors`, { errors: pluginComponents.errors });
       }
 
+      // Build agent configuration using the builder pattern
       const builtinAgents = createBuiltinAgents(
         pluginConfig.disabled_agents,
         pluginConfig.agents,
@@ -465,105 +375,30 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
 
       const userAgents = (pluginConfig.claude_code?.agents ?? true) ? loadUserAgents() : {};
       const projectAgents = (pluginConfig.claude_code?.agents ?? true) ? loadProjectAgents() : {};
-      const pluginAgents = pluginComponents.agents;
 
-      const isSisyphusEnabled = pluginConfig.sisyphus_agent?.disabled !== true;
-      const builderEnabled = pluginConfig.sisyphus_agent?.default_builder_enabled ?? false;
-      const plannerEnabled = pluginConfig.sisyphus_agent?.planner_enabled ?? true;
-      const replacePlan = pluginConfig.sisyphus_agent?.replace_plan ?? true;
+      const { agents: mergedAgents, defaultAgent } = createAgentConfigBuilder()
+        .withBuiltinAgents(builtinAgents)
+        .withUserAgents(userAgents)
+        .withProjectAgents(projectAgents)
+        .withPluginAgents(pluginComponents.agents)
+        .withBaseAgents(config.agent ?? {})
+        .withSisyphusConfig({
+          disabled: pluginConfig.sisyphus_agent?.disabled,
+          default_builder_enabled: pluginConfig.sisyphus_agent?.default_builder_enabled ?? false,
+          planner_enabled: pluginConfig.sisyphus_agent?.planner_enabled ?? true,
+          replace_plan: pluginConfig.sisyphus_agent?.replace_plan ?? true,
+        })
+        .withAgentOverrides(pluginConfig.agents ?? {})
+        .build();
 
-      if (isSisyphusEnabled && builtinAgents.Sisyphus) {
-        // Set Sisyphus as default agent (feature added in OpenCode PR #5843)
-        (config as { default_agent?: string }).default_agent = "Sisyphus";
-
-        const agentConfig: Record<string, unknown> = {
-          Sisyphus: builtinAgents.Sisyphus,
-        };
-
-        if (builderEnabled) {
-          const { name: _buildName, ...buildConfigWithoutName } = config.agent?.build ?? {};
-          const openCodeBuilderOverride = pluginConfig.agents?.["OpenCode-Builder"];
-          const openCodeBuilderBase = {
-            ...buildConfigWithoutName,
-            description: `${config.agent?.build?.description ?? "Build agent"} (OpenCode default)`,
-          };
-
-          agentConfig["OpenCode-Builder"] = openCodeBuilderOverride
-            ? { ...openCodeBuilderBase, ...openCodeBuilderOverride }
-            : openCodeBuilderBase;
-        }
-
-        if (plannerEnabled) {
-          const { name: _planName, ...planConfigWithoutName } = config.agent?.plan ?? {};
-          const plannerSisyphusOverride = pluginConfig.agents?.["Planner-Sisyphus"];
-          const plannerSisyphusBase = {
-            ...planConfigWithoutName,
-            prompt: PLAN_SYSTEM_PROMPT,
-            permission: PLAN_PERMISSION,
-            description: `${config.agent?.plan?.description ?? "Plan agent"} (OhMyOpenCode version)`,
-            color: config.agent?.plan?.color ?? "#6495ED",
-          };
-
-          agentConfig["Planner-Sisyphus"] = plannerSisyphusOverride
-            ? { ...plannerSisyphusBase, ...plannerSisyphusOverride }
-            : plannerSisyphusBase;
-        }
-
-        // Filter out build/plan from config.agent - they'll be re-added as subagents if replaced
-        const filteredConfigAgents = config.agent ? 
-          Object.fromEntries(
-            Object.entries(config.agent).filter(([key]) => {
-              if (key === "build") return false;
-              if (key === "plan" && replacePlan) return false;
-              return true;
-            })
-          ) : {};
-
-        config.agent = {
-          ...agentConfig,
-          ...Object.fromEntries(Object.entries(builtinAgents).filter(([k]) => k !== "Sisyphus")),
-          ...userAgents,
-          ...projectAgents,
-          ...pluginAgents,
-          ...filteredConfigAgents,  // Filtered config agents (excludes build/plan if replaced)
-          // Demote build/plan to subagent mode when replaced
-          build: { ...config.agent?.build, mode: "subagent" },
-          ...(replacePlan ? { plan: { ...config.agent?.plan, mode: "subagent" } } : {}),
-        };
-      } else {
-        config.agent = {
-          ...builtinAgents,
-          ...userAgents,
-          ...projectAgents,
-          ...pluginAgents,
-          ...config.agent,
-        };
+      config.agent = mergedAgents;
+      if (defaultAgent) {
+        (config as { default_agent?: string }).default_agent = defaultAgent;
       }
 
       config.tools = {
         ...config.tools,
       };
-
-      if (config.agent.explore) {
-        config.agent.explore.tools = {
-          ...config.agent.explore.tools,
-          call_omo_agent: false,
-        };
-      }
-      if (config.agent.librarian) {
-        config.agent.librarian.tools = {
-          ...config.agent.librarian.tools,
-          call_omo_agent: false,
-        };
-      }
-      if (config.agent["multimodal-looker"]) {
-        config.agent["multimodal-looker"].tools = {
-          ...config.agent["multimodal-looker"].tools,
-          task: false,
-          call_omo_agent: false,
-          look_at: false,
-        };
-      }
 
       config.permission = {
         ...config.permission,
