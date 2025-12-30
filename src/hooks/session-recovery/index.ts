@@ -391,6 +391,11 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
 
       if (errorType === "tool_result_missing") {
         success = await recoverToolResultMissing(ctx.client, sessionID, failedMsg)
+        if (success && experimental?.auto_resume) {
+          const lastUser = findLastUserMessage(msgs ?? [])
+          const resumeConfig = extractResumeConfig(lastUser, sessionID)
+          await resumeSession(ctx.client, resumeConfig)
+        }
       } else if (errorType === "thinking_block_order") {
         success = await recoverThinkingBlockOrder(ctx.client, sessionID, failedMsg, ctx.directory, info.error)
         if (success && experimental?.auto_resume) {
@@ -400,6 +405,13 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
         }
       } else if (errorType === "thinking_disabled_violation") {
         success = await recoverThinkingDisabledViolation(ctx.client, sessionID, failedMsg)
+        if (success && experimental?.auto_resume) {
+          const lastUser = findLastUserMessage(msgs ?? [])
+          const resumeConfig = extractResumeConfig(lastUser, sessionID)
+          await resumeSession(ctx.client, resumeConfig)
+        }
+      } else if (errorType === "empty_content_message") {
+        success = await recoverEmptyContentMessage(ctx.client, sessionID, failedMsg, ctx.directory, info.error)
         if (success && experimental?.auto_resume) {
           const lastUser = findLastUserMessage(msgs ?? [])
           const resumeConfig = extractResumeConfig(lastUser, sessionID)
