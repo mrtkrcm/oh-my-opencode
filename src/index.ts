@@ -25,6 +25,8 @@ import {
   createEmptyMessageSanitizerHook,
   createThinkingBlockValidatorHook,
   createRalphLoopHook,
+  createInfinityModeEnforcer,
+  detectInfinityMode,
 } from "./hooks";
 import { createGoogleAntigravityAuthPlugin } from "./auth/antigravity";
 import {
@@ -57,7 +59,7 @@ import {
   setMainSession,
   getMainSessionID,
 } from "./features/claude-code-session-state";
-import { builtinTools, createCallOmoAgent, createBackgroundTools, createLookAt, createSkillTool, interactive_bash, getTmuxPath } from "./tools";
+import { builtinTools, createCallOmoAgent, createBackgroundTools, createLookAt, createSkillTool, createParallelExecuteTool, interactive_bash, getTmuxPath } from "./tools";
 import { BackgroundManager } from "./features/background-agent";
 import { createBuiltinMcps } from "./mcp";
 import { type OhMyOpenCodeConfig, type HookName, loadPluginConfigAsync } from "./config";
@@ -227,6 +229,14 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
     ? createRalphLoopHook(ctx, { config: pluginConfig.ralph_loop })
     : null;
 
+  const infinityModeEnforcer = isHookEnabled("infinity-mode-enforcer")
+    ? createInfinityModeEnforcer(ctx, {
+        maxIterations: pluginConfig.infinity_mode?.max_iterations,
+        contextThreshold: pluginConfig.infinity_mode?.context_threshold,
+        enabled: pluginConfig.infinity_mode?.enabled,
+      })
+    : null;
+
   const backgroundManager = new BackgroundManager(ctx);
 
   const todoContinuationEnforcer = isHookEnabled("todo-continuation-enforcer")
@@ -243,7 +253,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
     : null;
   const backgroundTools = createBackgroundTools(backgroundManager, ctx.client);
 
-  const callOmoAgent = createCallOmoAgent(ctx, backgroundManager);
+const callOmoAgent = createCallOmoAgent(ctx, backgroundManager);
   const lookAt = createLookAt(ctx);
   const builtinSkills = createBuiltinSkills();
   const includeClaudeSkills = pluginConfig.claude_code?.skills !== false;
@@ -256,6 +266,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
     discoverOpencodeProjectSkills(),
   );
   const skillTool = createSkillTool({ skills: mergedSkills });
+  const parallelExecute = createParallelExecuteTool(ctx, backgroundManager);
 
   const googleAuthHooks = pluginConfig.google_auth !== false
     ? await createGoogleAntigravityAuthPlugin(ctx)
@@ -266,12 +277,13 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
   return {
     ...(googleAuthHooks ? { auth: googleAuthHooks.auth } : {}),
 
-    tool: {
+tool: {
       ...builtinTools,
       ...backgroundTools,
       call_omo_agent: callOmoAgent,
       look_at: lookAt,
       skill: skillTool,
+      parallel_execute: parallelExecute,
       ...(tmuxAvailable ? { interactive_bash } : {}),
     },
 
@@ -287,14 +299,14 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
           .join("\n")
           .trim() || "";
 
-        const isRalphLoopTemplate = promptText.includes("You are starting a Ralph Loop") && 
+        const isRalphLoopTemplate = promptText.includes("You are starting a Ralph Loop") &&
           promptText.includes("<user-task>");
         const isCancelRalphTemplate = promptText.includes("Cancel the currently active Ralph Loop");
 
         if (isRalphLoopTemplate) {
           const taskMatch = promptText.match(/<user-task>\s*([\s\S]*?)\s*<\/user-task>/i);
           const rawTask = taskMatch?.[1]?.trim() || "";
-          
+
           const quotedMatch = rawTask.match(/^["'](.+?)["']/);
           const prompt = quotedMatch?.[1] || rawTask.split(/\s+--/)[0]?.trim() || "Complete the task as instructed";
 
@@ -309,6 +321,19 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
         } else if (isCancelRalphTemplate) {
           log("[ralph-loop] Cancelling loop from chat.message", { sessionID: input.sessionID });
           ralphLoop.cancelLoop(input.sessionID);
+        }
+      }
+
+      // Check for infinity mode activation
+      if (infinityModeEnforcer && !infinityModeEnforcer.isActive(input.sessionID)) {
+        const textParts = output.parts.filter(
+          (p): p is typeof p & { type: "text"; text: string } => p.type === "text"
+        );
+        const promptText = textParts.map(p => p.text ?? "").join(" ");
+
+        if (detectInfinityMode(promptText)) {
+          infinityModeEnforcer.activateForSession(input.sessionID, promptText);
+          log("Infinity mode activated for session", { sessionID: input.sessionID });
         }
       }
     },
@@ -451,6 +476,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
       await backgroundNotificationHook?.event(input);
       await sessionNotification?.(input);
       await todoContinuationEnforcer?.handler(input);
+      await infinityModeEnforcer?.handler(input);
       await contextWindowMonitor?.event(input);
       await directoryAgentsInjector?.event(input);
       await directoryReadmeInjector?.event(input);
