@@ -2,7 +2,7 @@
  * Parallel Execute Tool - Implementation
  */
 
-import { tool, type PluginInput } from "@opencode-ai/plugin"
+import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin"
 import type { BackgroundManager } from "../../features/background-agent"
 import type { ParallelExecuteArgs } from "./types"
 import { PARALLEL_EXECUTE_DESCRIPTION } from "./constants"
@@ -44,7 +44,7 @@ const inferenceCache = new InferenceCache()
 export function createParallelExecuteTool(
   ctx: PluginInput,
   backgroundManager: BackgroundManager
-) {
+): ToolDefinition {
   return tool({
     description: PARALLEL_EXECUTE_DESCRIPTION,
     args: {

@@ -25,8 +25,6 @@ import {
   createEmptyMessageSanitizerHook,
   createThinkingBlockValidatorHook,
   createRalphLoopHook,
-  createInfinityModeEnforcer,
-  detectInfinityMode,
 } from "./hooks";
 import { createGoogleAntigravityAuthPlugin } from "./auth/antigravity";
 import {
@@ -229,14 +227,6 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
     ? createRalphLoopHook(ctx, { config: pluginConfig.ralph_loop })
     : null;
 
-  const infinityModeEnforcer = isHookEnabled("infinity-mode-enforcer")
-    ? createInfinityModeEnforcer(ctx, {
-        maxIterations: pluginConfig.infinity_mode?.max_iterations,
-        contextThreshold: pluginConfig.infinity_mode?.context_threshold,
-        enabled: pluginConfig.infinity_mode?.enabled,
-      })
-    : null;
-
   const backgroundManager = new BackgroundManager(ctx);
 
   const todoContinuationEnforcer = isHookEnabled("todo-continuation-enforcer")
@@ -324,18 +314,6 @@ tool: {
         }
       }
 
-      // Check for infinity mode activation
-      if (infinityModeEnforcer && !infinityModeEnforcer.isActive(input.sessionID)) {
-        const textParts = output.parts.filter(
-          (p): p is typeof p & { type: "text"; text: string } => p.type === "text"
-        );
-        const promptText = textParts.map(p => p.text ?? "").join(" ");
-
-        if (detectInfinityMode(promptText)) {
-          infinityModeEnforcer.activateForSession(input.sessionID, promptText);
-          log("Infinity mode activated for session", { sessionID: input.sessionID });
-        }
-      }
     },
 
     "experimental.chat.messages.transform": async (
@@ -476,7 +454,6 @@ tool: {
       await backgroundNotificationHook?.event(input);
       await sessionNotification?.(input);
       await todoContinuationEnforcer?.handler(input);
-      await infinityModeEnforcer?.handler(input);
       await contextWindowMonitor?.event(input);
       await directoryAgentsInjector?.event(input);
       await directoryReadmeInjector?.event(input);
